@@ -100,7 +100,12 @@ object MonoRuntime {
         "DOTNET_SYSTEM_GLOBALIZATION_INVARIANT" to "1",
         "HOME" to context.filesDir.absolutePath,
         "TMPDIR" to File(context.filesDir, "tmp").apply { mkdirs() }.absolutePath,
-    ) + budget(context).toEnv()
+    ) + budget(context).toEnv() + mapOf(
+        // Diagnostic: route Mono's own log (which on Android defaults to
+        // logcat) to a file the user can read beside the build folder.
+        "MONO_LOG_LEVEL" to "warning",
+        "MONO_LOG_DEST" to File(context.getExternalFilesDir(null) ?: context.filesDir, "mono.log").absolutePath,
+    )
 
     /**
      * How much of the device one .NET run is allowed to help itself to.
@@ -472,7 +477,10 @@ object MonoRuntime {
             out.delete()
             // Read before this, so deleting here rather than after the read
             // is what keeps a cancelled run from leaving one behind.
-            val code = result.takeIf { it.isFile }?.readText()?.trim()?.toIntOrNull()
+            // Unsigned first: the native side writes the code with %u, so -1 arrives as
+            // 4294967295, which toIntOrNull() rejects.
+            val code = result.takeIf { it.isFile }?.readText()?.trim()
+                ?.let { it.toUIntOrNull()?.toInt() ?: it.toIntOrNull() }
             result.delete()
             exitCode = code
         }
