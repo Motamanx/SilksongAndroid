@@ -1,3 +1,4 @@
+
 // MonoService — the process the .NET runtime runs in.
 //
 // It exists to be a process, not to be a service. The launcher runs four .NET
@@ -173,9 +174,25 @@ open class MonoService : Service() {
         thread(name = "mono") {
             try {
                 MonoBridge.load()
-                // Writes the result file itself, including when the program
-                // leaves through Environment.Exit and never comes back here.
-                MonoBridge.nativeRun(assembly, args, cwd, bcl, runtime, env, outPath, resultPath)
+
+                // Run the assembly and keep its returned exit code.
+                val nativeCode = MonoBridge.nativeRun(
+                    assembly, args, cwd, bcl, runtime, env, outPath, resultPath
+                )
+
+                // Diagnostic fallback:
+                // Some early native return paths return a code without
+                // creating the result file. Preserve that code for the
+                // launcher instead of leaving it with the default FAILED code.
+                if (!File(resultPath).isFile) {
+                    runCatching {
+                        File(outPath).appendText(
+                            "monojni: nativeRun returned $nativeCode without writing an exit result\n"
+                        )
+                    }
+                    File(resultPath).writeText(nativeCode.toString())
+                }
+
             } catch (t: Throwable) {
                 // The output file is the only channel back, and the launcher
                 // is about to stop reading it, so anything worth saying has to
