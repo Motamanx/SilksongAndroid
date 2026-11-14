@@ -48,6 +48,7 @@
 #include <fcntl.h>
 #include <jni.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -66,6 +67,9 @@ typedef int (*coreclr_initialize_fn)(
 typedef int (*coreclr_execute_assembly_fn)(
     void *hostHandle, unsigned int domainId, int argc, const char **argv,
     const char *managedAssemblyPath, unsigned int *exitCode);
+
+typedef int (*coreclr_shutdown_2_fn)(
+    void *hostHandle, unsigned int domainId, int *latchedExitCode);
 
 // A growable string, for the trusted assembly list: every assembly the runtime
 // is allowed to load, ':'-separated, which for a whole class library is tens of
@@ -129,6 +133,16 @@ static void write_result(void) {
     fflush(f);
     fclose(f);
     rename(tmp, g_result_path);
+}
+
+// Diagnostic: coreclr_shutdown_2 is given 20 seconds. If it hangs, the process
+// ends here instead of leaving the launcher waiting for ever for a result
+// file that would never appear. write() and _exit() are async-signal-safe.
+static void shutdown_watchdog(int sig) {
+    (void)sig;
+    static const char m[] = "monojni: coreclr_shutdown_2 did not finish in 20s\n";
+    write(STDERR_FILENO, m, sizeof(m) - 1);
+    _exit(121);
 }
 
 static int sb_add(strbuf *b, const char *s) {
@@ -396,9 +410,28 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
     g_exit_code = exit_code;
     g_have_exit_code = 1;
 
-    // Deliberately no coreclr_shutdown. The process is killed after this
-    // returns, which is both faster and safer than asking a runtime that may
-    // have just failed to unwind itself politely.
+    // Diagnostic (the one change in this build): shut the runtime down so the
+    // managed side runs its ProcessExit handlers and flushes any output it is
+    // still holding. Before this, a program that returned from Main instead of
+    // calling Environment.Exit could lose whatever it had buffered, which
+    // would look exactly like a program that printed nothing.
+    coreclr_shutdown_2_fn cc_shutdown =
+        (coreclr_shutdown_2_fn)dlsym(rt, "coreclr_shutdown_2");
+    if (cc_shutdown) {
+        fprintf(stderr, "monojni: shutting the runtime down to flush managed output\n");
+        fflush(stderr);
+        signal(SIGALRM, shutdown_watchdog);
+        alarm(20);
+        int latched = 0;
+        int shr = cc_shutdown(host, domain, &latched);
+        alarm(0);
+        fprintf(stderr, "monojni: shutdown hr=0x%08x latched exit=%d\n",
+                (unsigned)shr, latched);
+        fflush(stderr);
+    } else {
+        fprintf(stderr, "monojni: coreclr_shutdown_2 is not exported by this runtime\n");
+        fflush(stderr);
+    }
     fflush(stdout);
     fflush(stderr);
     write_result();
