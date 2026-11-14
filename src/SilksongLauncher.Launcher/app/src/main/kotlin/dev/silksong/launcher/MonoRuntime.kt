@@ -257,7 +257,7 @@ object MonoRuntime {
             // where SGen thrashes and the first ten minutes produce no files.
             gb >= 6.6 -> Budget(cores, 2560)
             gb >= 5.2 -> Budget(cores.coerceAtMost(4), 1024)
-            gb >= 3.2 -> Budget(cores.coerceAtMost(2), 640)
+            gb >= 3.2 -> Budget(1, 640)
             else -> Budget(1, FLOOR_HEAP_MB)
         }
     }
