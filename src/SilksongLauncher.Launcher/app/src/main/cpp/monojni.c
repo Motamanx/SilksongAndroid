@@ -1,3 +1,4 @@
+
 // monojni — the .NET host, as a library loaded into a process that has a JVM.
 //
 // This began as monohost, an ordinary executable, and the reason it is not one
@@ -111,10 +112,13 @@ static void write_result(void) {
     // ask the runtime when this is the exit() path.
     if (!g_have_exit_code && g_exitcode_get) code = (unsigned int)g_exitcode_get();
 
+    // Diagnostic: record the exit code before writing the result file.
+    LOGI("nativeRun: final exit code=%u", code);
+
     // Written to one side and renamed into place. The launcher treats the
     // result file existing as "the run is over and the code is readable", and
-    // open-then-write leaves a moment where it exists and is empty; a rename
-    // within a directory is atomic, so it never sees a half-written answer.
+    // open-then-write leaves a moment where it exists and is empty; a seek to
+    // a byte offset lands in the middle of one.
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "%s.tmp", g_result_path);
     FILE *f = fopen(tmp, "w");
@@ -180,6 +184,9 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
     jstring j_out, jstring j_result) {
     (void)clazz;
 
+    // Diagnostic: confirm that nativeRun was entered.
+    LOGI("nativeRun: entered");
+
     char *assembly = dup_jstring(env, j_assembly);
     char *cwd = dup_jstring(env, j_cwd);
     char *bcl = dup_jstring(env, j_bcl);
@@ -197,7 +204,7 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
 
     if (!assembly || !bcl || !runtime_dir) return 120;
 
-    // Everything the runtime writes to stdout or stderr goes to a file the
+    // Everything the runtime writes to stdout and stderr goes to a file the
     // launcher is tailing. A pipe would be the obvious choice and was the
     // first one; it cannot be used, because the descriptor has to reach this
     // process through the Intent that starts the service and the activity
@@ -325,8 +332,16 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
 
     void *host = NULL;
     unsigned int domain = 0;
+
+    // Diagnostic: show when Mono CoreCLR initialization begins.
+    LOGI("nativeRun: starting CoreCLR");
+
     int hr = cc_init(assembly, "silksong-builder",
                      (int)(sizeof(keys) / sizeof(keys[0])), keys, values, &host, &domain);
+
+    // Diagnostic: record the CoreCLR initialization result.
+    LOGI("nativeRun: CoreCLR result=0x%08x", (unsigned)hr);
+
     if (hr < 0) {
         fprintf(stderr, "monojni: the runtime failed to start: 0x%08x\n", (unsigned)hr);
         LOGE("coreclr_initialize failed: 0x%08x", (unsigned)hr);
@@ -342,6 +357,10 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
     LOGI("running %s with %d argument(s)", assembly, argc);
     unsigned int exit_code = 0;
     hr = cc_exec(host, domain, argc, argv, assembly, &exit_code);
+
+    // Diagnostic: record the assembly execution result.
+    LOGI("nativeRun: execute result=0x%08x exit=%u", (unsigned)hr, exit_code);
+
     if (hr < 0) {
         fprintf(stderr, "monojni: could not run %s: 0x%08x\n", assembly, (unsigned)hr);
         return 120;
