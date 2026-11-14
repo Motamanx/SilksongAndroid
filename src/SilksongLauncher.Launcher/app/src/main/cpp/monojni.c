@@ -24,8 +24,8 @@
 //
 // So the runtime has to live in a process that has a JVM, which on Android
 // means an app process. It gets one of its own -- see MonoService and the two
-// builder processes in the manifest -- rather than the launcher's, because the
-// isolation a subprocess gave away for free is worth keeping:
+// builder processes in the manifest -- rather than the launcher's, because
+// the isolation a subprocess gave away for free is worth keeping:
 //
 //   il2cpp calls Environment.Exit, which ends the process it is running in.
 //   In a builder that is a process whose whole purpose is to be ended.
@@ -68,8 +68,8 @@ typedef int (*coreclr_execute_assembly_fn)(
     const char *managedAssemblyPath, unsigned int *exitCode);
 
 // A growable string, for the trusted assembly list: every assembly the runtime
-// is allowed to load, ':'-separated, which for a whole class library is tens
-// of kilobytes -- too long for a fixed buffer and too important to truncate.
+// is allowed to load, ':'-separated, which for a whole class library is tens of
+// kilobytes -- too long for a fixed buffer and too important to truncate.
 typedef struct { char *data; size_t len, cap; } strbuf;
 
 // Where the exit code is left for the launcher, and how it gets written even
@@ -112,8 +112,10 @@ static void write_result(void) {
     // ask the runtime when this is the exit() path.
     if (!g_have_exit_code && g_exitcode_get) code = (unsigned int)g_exitcode_get();
 
-    // Diagnostic: record the exit code before writing the result file.
-    LOGI("nativeRun: final exit code=%u", code);
+    // Diagnostic: write the final code to convert.log before the result file
+    // appears and the launcher stops reading the output.
+    fprintf(stderr, "monojni: final exit code=%u\n", code);
+    fflush(stderr);
 
     // Written to one side and renamed into place. The launcher treats the
     // result file existing as "the run is over and the code is readable", and
@@ -202,8 +204,6 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
         atexit(write_result);
     }
 
-    if (!assembly || !bcl || !runtime_dir) return 120;
-
     // Everything the runtime writes to stdout and stderr goes to a file the
     // launcher is tailing. A pipe would be the obvious choice and was the
     // first one; it cannot be used, because the descriptor has to reach this
@@ -225,6 +225,22 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
             setvbuf(stdout, NULL, _IOLBF, 0);
             setvbuf(stderr, NULL, _IONBF, 0);
         }
+    }
+
+    // Diagnostic: record entry and the JNI arguments in convert.log.
+    fprintf(stderr,
+            "monojni: nativeRun reached; assembly=%s bcl=%s runtime=%s\n",
+            assembly ? assembly : "(null)",
+            bcl ? bcl : "(null)",
+            runtime_dir ? runtime_dir : "(null)");
+    fflush(stderr);
+
+    // Check required arguments only after stderr has been redirected, so
+    // early failures are visible in convert.log too.
+    if (!assembly || !bcl || !runtime_dir) {
+        fprintf(stderr, "monojni: missing required JNI argument\n");
+        fflush(stderr);
+        return 120;
     }
 
     if (j_env) {
@@ -339,7 +355,11 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
     int hr = cc_init(assembly, "silksong-builder",
                      (int)(sizeof(keys) / sizeof(keys[0])), keys, values, &host, &domain);
 
-    // Diagnostic: record the CoreCLR initialization result.
+    // Diagnostic: record CoreCLR initialization in convert.log.
+    fprintf(stderr, "monojni: CoreCLR init hr=0x%08x\n", (unsigned)hr);
+    fflush(stderr);
+
+    // Diagnostic: record the CoreCLR initialization result in Logcat too.
     LOGI("nativeRun: CoreCLR result=0x%08x", (unsigned)hr);
 
     if (hr < 0) {
@@ -358,7 +378,12 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
     unsigned int exit_code = 0;
     hr = cc_exec(host, domain, argc, argv, assembly, &exit_code);
 
-    // Diagnostic: record the assembly execution result.
+    // Diagnostic: record assembly execution in convert.log.
+    fprintf(stderr, "monojni: execute hr=0x%08x exit=%u\n",
+            (unsigned)hr, exit_code);
+    fflush(stderr);
+
+    // Diagnostic: record the assembly execution result in Logcat too.
     LOGI("nativeRun: execute result=0x%08x exit=%u", (unsigned)hr, exit_code);
 
     if (hr < 0) {
