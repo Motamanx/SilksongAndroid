@@ -48,6 +48,7 @@
 #include <fcntl.h>
 #include <jni.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -143,6 +144,126 @@ static void shutdown_watchdog(int sig) {
     static const char m[] = "monojni: coreclr_shutdown_2 did not finish in 20s\n";
     write(STDERR_FILENO, m, sizeof(m) - 1);
     _exit(121);
+}
+
+// Diagnostic: a sampler that reports, every few seconds while the program runs,
+// what this process is doing. It makes no assumption about the runtime: it only
+// reads /proc/self. CPU time close to wall time means the program is working;
+// CPU time far below it means it is waiting for something. The open files show
+// what it is reading and writing.
+static volatile int g_sampler_stop = 0;
+
+static long sampler_status_kb(const char *key) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long v = -1;
+    size_t n = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        if (strncmp(line, key, n) == 0) {
+            v = strtol(line + n, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return v;
+}
+
+// Fills the user and system CPU time of a /proc stat file, in clock ticks, and
+// the state letter. Fields are read after the last ')' because the process
+// name in field 2 may itself contain spaces or parentheses.
+static int sampler_read_stat(const char *path, unsigned long *ut, unsigned long *st, char *state) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    if (!p) return 0;
+    char s = '?';
+    unsigned long u = 0, k = 0;
+    if (sscanf(p + 1, " %c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &s, &u, &k) < 3) return 0;
+    if (ut) *ut = u;
+    if (st) *st = k;
+    if (state) *state = s;
+    return 1;
+}
+
+static void sampler_report(const char *tag, int t) {
+    long clk = sysconf(_SC_CLK_TCK);
+    if (clk <= 0) clk = 100;
+    unsigned long ut = 0, st = 0;
+    sampler_read_stat("/proc/self/stat", &ut, &st, NULL);
+    int r = 0, s = 0, d = 0, other = 0, total = 0;
+    DIR *dir = opendir("/proc/self/task");
+    if (dir) {
+        struct dirent *e;
+        while ((e = readdir(dir)) != NULL) {
+            if (e->d_name[0] == '.') continue;
+            char path[320];
+            snprintf(path, sizeof path, "/proc/self/task/%s/stat", e->d_name);
+            char state = '?';
+            if (!sampler_read_stat(path, NULL, NULL, &state)) continue;
+            total++;
+            if (state == 'R') r++;
+            else if (state == 'S') s++;
+            else if (state == 'D') d++;
+            else other++;
+        }
+        closedir(dir);
+    }
+    fprintf(stderr,
+            "monojni: %s t=%ds rss=%ldMB peak=%ldMB cpu=%.1fs (user %.1f sys %.1f) "
+            "threads=%d (running %d, sleeping %d, disk-wait %d, other %d)\n",
+            tag, t, sampler_status_kb("VmRSS:") / 1024, sampler_status_kb("VmHWM:") / 1024,
+            (double)(ut + st) / (double)clk, (double)ut / (double)clk, (double)st / (double)clk,
+            total, r, s, d, other);
+    fflush(stderr);
+}
+
+// Lists the regular files the process has open, so the log shows what it is
+// reading. Sockets, pipes and anonymous handles are only counted.
+static void sampler_fds(const char *tag, int t) {
+    DIR *dir = opendir("/proc/self/fd");
+    if (!dir) return;
+    int shown = 0, other = 0;
+    struct dirent *e;
+    while ((e = readdir(dir)) != NULL) {
+        if (e->d_name[0] == '.') continue;
+        char path[320], target[PATH_MAX];
+        snprintf(path, sizeof path, "/proc/self/fd/%s", e->d_name);
+        ssize_t n = readlink(path, target, sizeof target - 1);
+        if (n <= 0) continue;
+        target[n] = 0;
+        if (target[0] != '/' || strncmp(target, "/dev/", 5) == 0 || strncmp(target, "/proc/", 6) == 0) {
+            other++;
+            continue;
+        }
+        if (shown < 40) {
+            fprintf(stderr, "monojni: %s t=%ds fd %s -> %.200s\n", tag, t, e->d_name, target);
+            shown++;
+        } else {
+            other++;
+        }
+    }
+    closedir(dir);
+    fprintf(stderr, "monojni: %s t=%ds open files shown=%d, others=%d\n", tag, t, shown, other);
+    fflush(stderr);
+}
+
+static void *sampler_main(void *arg) {
+    (void)arg;
+    int t = 0;
+    while (!g_sampler_stop) {
+        sleep(1);
+        t++;
+        if (g_sampler_stop) break;
+        if (t % 5 != 0) continue;
+        sampler_report("sample", t);
+        if (t == 15 || t == 45 || t == 75) sampler_fds("sample", t);
+    }
+    return NULL;
 }
 
 static int sb_add(strbuf *b, const char *s) {
@@ -390,7 +511,20 @@ Java_dev_silksong_launcher_MonoBridge_nativeRun(
 
     LOGI("running %s with %d argument(s)", assembly, argc);
     unsigned int exit_code = 0;
+
+    // Diagnostic: start the sampler just before the program does.
+    {
+        pthread_t sampler;
+        if (pthread_create(&sampler, NULL, sampler_main, NULL) == 0) {
+            pthread_detach(sampler);
+        } else {
+            fprintf(stderr, "monojni: could not start the sampler thread\n");
+        }
+    }
     hr = cc_exec(host, domain, argc, argv, assembly, &exit_code);
+    g_sampler_stop = 1;
+    sampler_report("on return", -1);
+    sampler_fds("on return", -1);
 
     // Diagnostic: record assembly execution in convert.log.
     fprintf(stderr, "monojni: execute hr=0x%08x exit=%u\n",
