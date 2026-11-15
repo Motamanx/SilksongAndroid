@@ -49,6 +49,7 @@
 #include <jni.h>
 #include <limits.h>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -153,8 +154,8 @@ static void shutdown_watchdog(int sig) {
 // what it is reading and writing.
 static volatile int g_sampler_stop = 0;
 
-static long sampler_status_kb(const char *key) {
-    FILE *f = fopen("/proc/self/status", "r");
+static long sampler_kb(const char *path, const char *key) {
+    FILE *f = fopen(path, "r");
     if (!f) return -1;
     char line[256];
     long v = -1;
@@ -167,6 +168,56 @@ static long sampler_status_kb(const char *key) {
     }
     fclose(f);
     return v;
+}
+
+static long sampler_status_kb(const char *key) { return sampler_kb("/proc/self/status", key); }
+static long sampler_meminfo_kb(const char *key) { return sampler_kb("/proc/meminfo", key); }
+
+// Reads the first line of a small text file, without the newline. Returns 0 if
+// the file cannot be read, which for /sys is common on a locked-down system.
+static int sampler_line(const char *path, char *out, size_t cap) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    if (!fgets(out, (int)cap, f)) { fclose(f); return 0; }
+    fclose(f);
+    size_t n = strlen(out);
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+    return 1;
+}
+
+// What could cap this process's memory, printed once. A limit near the size at
+// which the program stops would be the whole explanation.
+static void sampler_limits(void) {
+    struct rlimit as, data;
+    char as_s[32] = "?", data_s[32] = "?";
+    if (getrlimit(RLIMIT_AS, &as) == 0) {
+        if (as.rlim_cur == RLIM_INFINITY) snprintf(as_s, sizeof as_s, "unlimited");
+        else snprintf(as_s, sizeof as_s, "%llu MB", (unsigned long long)as.rlim_cur / (1024 * 1024));
+    }
+    if (getrlimit(RLIMIT_DATA, &data) == 0) {
+        if (data.rlim_cur == RLIM_INFINITY) snprintf(data_s, sizeof data_s, "unlimited");
+        else snprintf(data_s, sizeof data_s, "%llu MB", (unsigned long long)data.rlim_cur / (1024 * 1024));
+    }
+    char oc[64] = "unreadable";
+    sampler_line("/proc/sys/vm/overcommit_memory", oc, sizeof oc);
+    fprintf(stderr, "monojni: limits address-space=%s data=%s overcommit_memory=%s\n", as_s, data_s, oc);
+
+    char cg[256] = "";
+    char path[512];
+    if (sampler_line("/proc/self/cgroup", cg, sizeof cg)) {
+        const char *rel = strstr(cg, "::");
+        rel = rel ? rel + 2 : "";
+        const char *names[] = {"memory.max", "memory.high", "memory.current", "memory.swap.max"};
+        for (int i = 0; i < 4; i++) {
+            char v[64] = "unreadable";
+            snprintf(path, sizeof path, "/sys/fs/cgroup%s/%s", rel, names[i]);
+            sampler_line(path, v, sizeof v);
+            fprintf(stderr, "monojni: cgroup %s %s=%s\n", rel, names[i], v);
+        }
+    } else {
+        fprintf(stderr, "monojni: cgroup unreadable\n");
+    }
+    fflush(stderr);
 }
 
 // Fills the user and system CPU time of a /proc stat file, in clock ticks, and
@@ -214,11 +265,18 @@ static void sampler_report(const char *tag, int t) {
         closedir(dir);
     }
     fprintf(stderr,
-            "monojni: %s t=%ds rss=%ldMB peak=%ldMB cpu=%.1fs (user %.1f sys %.1f) "
+            "monojni: %s t=%ds rss=%ldMB (anon %ld, file %ld, swapped %ld) virt=%ldMB cpu=%.1fs "
             "threads=%d (running %d, sleeping %d, disk-wait %d, other %d)\n",
-            tag, t, sampler_status_kb("VmRSS:") / 1024, sampler_status_kb("VmHWM:") / 1024,
-            (double)(ut + st) / (double)clk, (double)ut / (double)clk, (double)st / (double)clk,
+            tag, t, sampler_status_kb("VmRSS:") / 1024, sampler_status_kb("RssAnon:") / 1024,
+            sampler_status_kb("RssFile:") / 1024, sampler_status_kb("VmSwap:") / 1024,
+            sampler_status_kb("VmSize:") / 1024, (double)(ut + st) / (double)clk,
             total, r, s, d, other);
+    fprintf(stderr,
+            "monojni: %s t=%ds system: available=%ldMB free=%ldMB cached=%ldMB swap-free=%ldMB "
+            "commit=%ld/%ldMB\n",
+            tag, t, sampler_meminfo_kb("MemAvailable:") / 1024, sampler_meminfo_kb("MemFree:") / 1024,
+            sampler_meminfo_kb("Cached:") / 1024, sampler_meminfo_kb("SwapFree:") / 1024,
+            sampler_meminfo_kb("Committed_AS:") / 1024, sampler_meminfo_kb("CommitLimit:") / 1024);
     fflush(stderr);
 }
 
@@ -236,7 +294,10 @@ static void sampler_fds(const char *tag, int t) {
         ssize_t n = readlink(path, target, sizeof target - 1);
         if (n <= 0) continue;
         target[n] = 0;
-        if (target[0] != '/' || strncmp(target, "/dev/", 5) == 0 || strncmp(target, "/proc/", 6) == 0) {
+        if (target[0] != '/' || strncmp(target, "/dev/", 5) == 0 || strncmp(target, "/proc/", 6) == 0 ||
+            strncmp(target, "/apex/", 6) == 0 || strncmp(target, "/system/", 8) == 0 ||
+            strncmp(target, "/system_ext/", 12) == 0 || strncmp(target, "/vendor/", 8) == 0 ||
+            strncmp(target, "/product/", 9) == 0 || strncmp(target, "/sys/", 5) == 0) {
             other++;
             continue;
         }
@@ -254,6 +315,7 @@ static void sampler_fds(const char *tag, int t) {
 
 static void *sampler_main(void *arg) {
     (void)arg;
+    sampler_limits();
     int t = 0;
     while (!g_sampler_stop) {
         sleep(1);
