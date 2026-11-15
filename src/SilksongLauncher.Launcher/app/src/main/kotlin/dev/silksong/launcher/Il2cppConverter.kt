@@ -440,7 +440,8 @@ object Il2cppConverter {
                     // il2cpp resolves parts of its own installation relative to
                     // the working directory.
                     cwd = deploy,
-                    env = budget.toEnv(),
+                    // Diagnostic: Mono's exception trace, for this run only.
+                    env = budget.toEnv() + mapOf("MONO_TRACE" to "E:all"),
                 ) { line ->
                     sink.write(line); sink.write("\n")
                 }
