@@ -451,7 +451,9 @@ object Il2cppConverter {
             }
         }
 
-        var budget = MonoRuntime.budget(context)
+        // Diagnostic (the one change in this build): two workers instead of one.
+        // Every other budget setting, the heap included, is left as chosen.
+        var budget = MonoRuntime.budget(context).let { it.copy(cores = it.cores.coerceAtLeast(2)) }
         var result = attempt(budget)
         // Reclaimed rather than failed: the settings were too generous for
         // this device as it stood, so the same work is offered a smaller share
